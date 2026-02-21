@@ -1,0 +1,20 @@
+#pragma once
+#include <windows.h>
+#include <string>
+#include <cstdint>
+
+namespace Utils {
+
+// Format a byte count as a human-readable string (e.g. "1.23 GB")
+std::wstring FormatSize(uint64_t bytes);
+
+// Format a byte count as a short string without decimals for small values
+std::wstring FormatSizeShort(uint64_t bytes);
+
+// Combine a base path and a relative path with backslash separator
+std::wstring CombinePaths(const std::wstring& base, const std::wstring& relative);
+
+// Ensure a directory exists, creating intermediate directories as needed
+bool EnsureDirectoryExists(const std::wstring& path);
+
+} // namespace Utils

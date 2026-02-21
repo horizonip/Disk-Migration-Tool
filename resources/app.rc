@@ -1,0 +1,7 @@
+#include <windows.h>
+
+101 ICON "app.ico"
+
+// Manifest for ComCtl32 v6 visual styles
+// Type 24 = RT_MANIFEST, ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID
+1 24 "app.manifest"

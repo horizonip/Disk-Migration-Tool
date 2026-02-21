@@ -1,0 +1,79 @@
+#include "Utils.h"
+
+namespace Utils {
+
+std::wstring FormatSize(uint64_t bytes) {
+    const wchar_t* units[] = { L"bytes", L"KB", L"MB", L"GB", L"TB" };
+    int unitIndex = 0;
+    double size = static_cast<double>(bytes);
+
+    while (size >= 1024.0 && unitIndex < 4) {
+        size /= 1024.0;
+        unitIndex++;
+    }
+
+    wchar_t buf[64];
+    if (unitIndex == 0) {
+        swprintf_s(buf, L"%llu bytes", bytes);
+    } else {
+        swprintf_s(buf, L"%.1f %s", size, units[unitIndex]);
+    }
+    return buf;
+}
+
+std::wstring FormatSizeShort(uint64_t bytes) {
+    const wchar_t* units[] = { L"B", L"KB", L"MB", L"GB", L"TB" };
+    int unitIndex = 0;
+    double size = static_cast<double>(bytes);
+
+    while (size >= 1024.0 && unitIndex < 4) {
+        size /= 1024.0;
+        unitIndex++;
+    }
+
+    wchar_t buf[32];
+    if (unitIndex == 0) {
+        swprintf_s(buf, L"%llu B", bytes);
+    } else if (size < 10.0) {
+        swprintf_s(buf, L"%.2f %s", size, units[unitIndex]);
+    } else if (size < 100.0) {
+        swprintf_s(buf, L"%.1f %s", size, units[unitIndex]);
+    } else {
+        swprintf_s(buf, L"%.0f %s", size, units[unitIndex]);
+    }
+    return buf;
+}
+
+std::wstring CombinePaths(const std::wstring& base, const std::wstring& relative) {
+    if (base.empty()) return relative;
+    if (relative.empty()) return base;
+
+    std::wstring result = base;
+    if (result.back() != L'\\' && result.back() != L'/') {
+        result += L'\\';
+    }
+    return result + relative;
+}
+
+bool EnsureDirectoryExists(const std::wstring& path) {
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true;
+    }
+
+    // Find parent
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos != std::wstring::npos && pos > 0) {
+        std::wstring parent = path.substr(0, pos);
+        // Don't try to create drive root
+        if (parent.size() > 2 || (parent.size() == 2 && parent[1] != L':')) {
+            if (!EnsureDirectoryExists(parent)) {
+                return false;
+            }
+        }
+    }
+
+    return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+} // namespace Utils
