@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 
 struct FileNode {
@@ -35,6 +36,9 @@ public:
     void SelectAll();
     void DeselectAll();
 
+    // Set pointer to excluded paths (paths already on destination)
+    void SetExcludedPaths(const std::unordered_set<std::wstring>* excluded);
+
     // Auto-select items that fit within availableBytes
     void AutoSelect(uint64_t availableBytes);
 
@@ -45,6 +49,7 @@ public:
     struct SelectedFile {
         std::wstring sourcePath;
         std::wstring relativePath;
+        uint64_t size;
         bool isDirectory;
     };
     std::vector<SelectedFile> GetSelectedFiles() const;
@@ -84,4 +89,5 @@ private:
     void CollectLeaves(HTREEITEM hItem, std::vector<LeafItem>& leaves);
 
     bool suppressCheckHandling_ = false;
+    const std::unordered_set<std::wstring>* excludedPaths_ = nullptr;
 };

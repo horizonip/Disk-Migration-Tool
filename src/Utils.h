@@ -17,4 +17,7 @@ std::wstring CombinePaths(const std::wstring& base, const std::wstring& relative
 // Ensure a directory exists, creating intermediate directories as needed
 bool EnsureDirectoryExists(const std::wstring& path);
 
+// Write a wide string as UTF-8 + CRLF to a file handle
+void WriteLogLine(HANDLE hFile, const std::wstring& line);
+
 } // namespace Utils

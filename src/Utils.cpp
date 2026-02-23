@@ -1,4 +1,5 @@
 #include "Utils.h"
+#include <string>
 
 namespace Utils {
 
@@ -74,6 +75,17 @@ bool EnsureDirectoryExists(const std::wstring& path) {
     }
 
     return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+void WriteLogLine(HANDLE hFile, const std::wstring& line) {
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    int needed = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return;
+    std::string utf8(needed, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.c_str(), (int)line.size(), &utf8[0], needed, nullptr, nullptr);
+    utf8 += "\r\n";
+    DWORD written;
+    WriteFile(hFile, utf8.c_str(), (DWORD)utf8.size(), &written, nullptr);
 }
 
 } // namespace Utils

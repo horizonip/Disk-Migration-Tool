@@ -10,6 +10,7 @@ add_executable(DSplit WIN32
     src/DriveInfo.cpp
     src/FileTree.cpp
     src/Migration.cpp
+    src/TransferLog.cpp
     src/Utils.cpp
     resources/app.rc
 )

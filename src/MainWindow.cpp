@@ -12,6 +12,126 @@ static const int BUTTON_HEIGHT = 28;
 static const int BUTTON_WIDTH = 120;
 static const int LABEL_HEIGHT = 18;
 
+// ---------- Background drive indexing ----------
+
+struct IndexThreadData {
+    std::wstring driveRoot;
+    std::unordered_set<std::wstring>* resultSet;
+    std::atomic<bool>* cancelled;
+    HWND hWndNotify;
+    // Log file info
+    std::wstring logFilePath;       // Local log: {exe}\logs\DSplit_{serial}.log
+    std::wstring destLogFilePath;   // Drive root log: {drive}\DSplit_{serial}.log
+    std::wstring logFileName;       // Just the filename to skip during scan
+    std::wstring volumeName;
+    std::wstring driveLetter;
+    std::wstring serialHex;
+};
+
+static void WriteToLogs(HANDLE hLog, HANDLE hDestLog, const std::wstring& line) {
+    Utils::WriteLogLine(hLog, line);
+    Utils::WriteLogLine(hDestLog, line);
+}
+
+static void ScanDriveRecursive(const std::wstring& basePath, const std::wstring& relPrefix,
+                                std::unordered_set<std::wstring>& results,
+                                std::atomic<bool>& cancelled,
+                                HANDLE hLog, HANDLE hDestLog,
+                                const std::wstring& skipFileName) {
+    if (cancelled) return;
+
+    std::wstring searchPath = basePath;
+    if (!searchPath.empty() && searchPath.back() != L'\\') searchPath += L'\\';
+    searchPath += L'*';
+
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (cancelled) break;
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        // Skip system entries at drive root (e.g. $Recycle.Bin, System Volume Information)
+        if (relPrefix.empty() && (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM))
+            continue;
+
+        // Skip the log file itself at drive root
+        if (relPrefix.empty() && !skipFileName.empty() &&
+            _wcsicmp(fd.cFileName, skipFileName.c_str()) == 0)
+            continue;
+
+        std::wstring relPath = relPrefix.empty()
+            ? std::wstring(fd.cFileName)
+            : relPrefix + L"\\" + fd.cFileName;
+
+        std::wstring fullPath = basePath;
+        if (!fullPath.empty() && fullPath.back() != L'\\') fullPath += L'\\';
+        fullPath += fd.cFileName;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            results.insert(relPath + L"\\");
+            WriteToLogs(hLog, hDestLog, relPath + L"\\");
+            ScanDriveRecursive(fullPath, relPath, results, cancelled, hLog, hDestLog, skipFileName);
+        } else {
+            results.insert(relPath);
+            WriteToLogs(hLog, hDestLog, relPath);
+        }
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+}
+
+static HANDLE OpenLogForWrite(const std::wstring& path, const std::wstring& volumeName,
+                               const std::wstring& driveLetter, const std::wstring& serialHex) {
+    if (path.empty()) return INVALID_HANDLE_VALUE;
+
+    size_t sep = path.find_last_of(L"\\/");
+    if (sep != std::wstring::npos) {
+        Utils::EnsureDirectoryExists(path.substr(0, sep));
+    }
+
+    HANDLE h = CreateFileW(path.c_str(),
+        GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (h != INVALID_HANDLE_VALUE) {
+        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+        DWORD written;
+        WriteFile(h, bom, 3, &written, nullptr);
+        Utils::WriteLogLine(h, L"# DSplit Transfer Log");
+        Utils::WriteLogLine(h, L"# Volume: " + volumeName +
+                                   L" (" + driveLetter + L")");
+        Utils::WriteLogLine(h, L"# Serial: " + serialHex);
+    }
+    return h;
+}
+
+static DWORD WINAPI IndexThreadProc(LPVOID param) {
+    auto* data = static_cast<IndexThreadData*>(param);
+
+    // Open local log file ({exe}\logs\DSplit_{serial}.log)
+    HANDLE hLog = OpenLogForWrite(data->logFilePath,
+        data->volumeName, data->driveLetter, data->serialHex);
+
+    // Open destination drive root log ({drive}\DSplit_{serial}.log)
+    HANDLE hDestLog = OpenLogForWrite(data->destLogFilePath,
+        data->volumeName, data->driveLetter, data->serialHex);
+
+    ScanDriveRecursive(data->driveRoot, L"", *data->resultSet, *data->cancelled,
+        hLog, hDestLog, data->logFileName);
+
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+    if (hDestLog != INVALID_HANDLE_VALUE) CloseHandle(hDestLog);
+
+    PostMessageW(data->hWndNotify, WM_INDEXING_COMPLETE, 0, 0);
+    delete data;
+    return 0;
+}
+
+// ---------- Window registration & creation ----------
+
 bool MainWindow::Register(HINSTANCE hInstance) {
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -94,8 +214,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         }
         return 0;
 
+    case WM_INDEXING_COMPLETE:
+        if (self) self->OnIndexingComplete();
+        return 0;
+
     case WM_DESTROY:
         if (self) {
+            self->CancelDriveIndexing();
             if (self->hFont_) DeleteObject(self->hFont_);
             delete self;
             SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0);
@@ -110,6 +235,17 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
 void MainWindow::OnCreate(HWND hWnd) {
     hWnd_ = hWnd;
     hInstance_ = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hWnd, GWLP_HINSTANCE));
+
+    // Determine exe directory for log storage
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring exePathStr(exePath);
+    size_t lastSep = exePathStr.find_last_of(L"\\/");
+    if (lastSep != std::wstring::npos) {
+        exeDir_ = exePathStr.substr(0, lastSep);
+    } else {
+        exeDir_ = L".";
+    }
 
     // Create font
     NONCLIENTMETRICSW ncm = {};
@@ -171,6 +307,9 @@ void MainWindow::OnCreate(HWND hWnd) {
         BS_PUSHBUTTON, IDC_COPY_BTN);
     hMoveBtn_ = createCtrl(L"BUTTON", L"Move to Destination",
         BS_PUSHBUTTON, IDC_MOVE_BTN);
+    hVerifyCheck_ = createCtrl(L"BUTTON", L"Verify before delete",
+        BS_AUTOCHECKBOX, IDC_VERIFY_CHECK);
+    SendMessageW(hVerifyCheck_, BM_SETCHECK, BST_CHECKED, 0); // on by default
 
     // Progress section
     hProgressBar_ = CreateWindowExW(0, PROGRESS_CLASSW, L"",
@@ -186,6 +325,13 @@ void MainWindow::OnCreate(HWND hWnd) {
         hWnd, reinterpret_cast<HMENU>(IDC_PROGRESS_LABEL),
         hInstance_, nullptr);
     SendMessageW(hProgressLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(hFont_), TRUE);
+
+    hSpeedLabel_ = CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | SS_RIGHT,
+        0, 0, 0, 0,
+        hWnd, reinterpret_cast<HMENU>(IDC_SPEED_LABEL),
+        hInstance_, nullptr);
+    SendMessageW(hSpeedLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(hFont_), TRUE);
 
     hCancelBtn_ = CreateWindowExW(0, L"BUTTON", L"Cancel",
         WS_CHILD | BS_PUSHBUTTON,
@@ -203,6 +349,13 @@ void MainWindow::OnCreate(HWND hWnd) {
     if (!drives_.empty()) {
         SendMessageW(hDriveCombo_, CB_SETCURSEL, 0, 0);
         selectedDriveIndex_ = 0;
+
+        // Load transfer log for initial drive (no popup on startup)
+        std::wstring serialHex = TransferLog::FormatSerial(drives_[0].serialNumber);
+        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
+        if (logLoaded_) {
+            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
+        }
     }
 
     // Trigger initial layout
@@ -265,6 +418,8 @@ void MainWindow::OnSize(int width, int height) {
     MoveWindow(hCopyBtn_, bx, y, actionBtnWidth, BUTTON_HEIGHT, TRUE);
     bx += actionBtnWidth + btnSpacing;
     MoveWindow(hMoveBtn_, bx, y, actionBtnWidth, BUTTON_HEIGHT, TRUE);
+    bx += actionBtnWidth + btnSpacing;
+    MoveWindow(hVerifyCheck_, bx, y, 160, BUTTON_HEIGHT, TRUE);
     y += BUTTON_HEIGHT + MARGIN;
 
     // Progress bar + label + cancel
@@ -272,7 +427,9 @@ void MainWindow::OnSize(int width, int height) {
     MoveWindow(hProgressBar_, x, y, contentWidth - cancelWidth - 6, CONTROL_HEIGHT, TRUE);
     MoveWindow(hCancelBtn_, x + contentWidth - cancelWidth, y, cancelWidth, CONTROL_HEIGHT, TRUE);
     y += CONTROL_HEIGHT + 2;
-    MoveWindow(hProgressLabel_, x, y, contentWidth, LABEL_HEIGHT, TRUE);
+    int speedWidth = 160;
+    MoveWindow(hProgressLabel_, x, y, contentWidth - speedWidth - 6, LABEL_HEIGHT, TRUE);
+    MoveWindow(hSpeedLabel_, x + contentWidth - speedWidth, y, speedWidth, LABEL_HEIGHT, TRUE);
 }
 
 void MainWindow::OnCommand(WORD id, WORD code) {
@@ -332,6 +489,107 @@ void MainWindow::OnNotify(NMHDR* pnm) {
     }
 }
 
+// ---------- Drive indexing ----------
+
+void MainWindow::StartDriveIndexing() {
+    CancelDriveIndexing();
+    driveIndex_.clear();
+    filteredExclusions_.clear();
+    fileTree_.SetExcludedPaths(nullptr);
+
+    if (selectedDriveIndex_ < 0) return;
+
+    indexCancelled_ = false;
+
+    std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
+
+    std::wstring logFileName = L"DSplit_" + serialHex + L".log";
+
+    auto* data = new IndexThreadData();
+    data->driveRoot = drives_[selectedDriveIndex_].rootPath;
+    data->resultSet = &driveIndex_;
+    data->cancelled = &indexCancelled_;
+    data->hWndNotify = hWnd_;
+    data->logFilePath = Utils::CombinePaths(
+        Utils::CombinePaths(exeDir_, L"logs"), logFileName);
+    data->destLogFilePath = Utils::CombinePaths(
+        drives_[selectedDriveIndex_].rootPath, logFileName);
+    data->logFileName = logFileName;
+    data->volumeName = drives_[selectedDriveIndex_].volumeName;
+    data->driveLetter = drives_[selectedDriveIndex_].driveLetter;
+    data->serialHex = serialHex;
+
+    hIndexThread_ = CreateThread(nullptr, 0, IndexThreadProc, data, 0, nullptr);
+    if (hIndexThread_) {
+        SetWindowTextW(hStatusLabel_, L"Indexing destination drive...");
+        EnableWindow(hAutoSelectBtn_, FALSE);
+        EnableWindow(hCopyBtn_, FALSE);
+        EnableWindow(hMoveBtn_, FALSE);
+    } else {
+        delete data;
+    }
+}
+
+void MainWindow::CancelDriveIndexing() {
+    if (hIndexThread_) {
+        indexCancelled_ = true;
+        WaitForSingleObject(hIndexThread_, 5000);
+        CloseHandle(hIndexThread_);
+        hIndexThread_ = nullptr;
+    }
+}
+
+void MainWindow::OnIndexingComplete() {
+    if (hIndexThread_) {
+        CloseHandle(hIndexThread_);
+        hIndexThread_ = nullptr;
+    }
+
+    EnableWindow(hAutoSelectBtn_, TRUE);
+    EnableWindow(hCopyBtn_, TRUE);
+    EnableWindow(hMoveBtn_, TRUE);
+
+    // Reload the log that was just written so logLoaded_ is set
+    if (selectedDriveIndex_ >= 0) {
+        std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
+        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
+    }
+
+    // If a source folder is already loaded, build exclusions now
+    if (!fileTree_.GetSourceFolder().empty()) {
+        BuildFilteredExclusions();
+        fileTree_.SetExcludedPaths(&filteredExclusions_);
+    }
+
+    UpdateStatusBar();
+}
+
+void MainWindow::BuildFilteredExclusions() {
+    filteredExclusions_.clear();
+
+    std::wstring sourceFolder = fileTree_.GetSourceFolder();
+    if (sourceFolder.empty() || driveIndex_.empty()) return;
+
+    // Extract source folder name
+    std::wstring folderName;
+    size_t lastSep = sourceFolder.find_last_of(L"\\/");
+    if (lastSep != std::wstring::npos)
+        folderName = sourceFolder.substr(lastSep + 1);
+    else
+        folderName = sourceFolder;
+
+    // Filter driveIndex_ paths under folderName\, strip the prefix
+    std::wstring prefix = folderName + L"\\";
+    for (const auto& p : driveIndex_) {
+        if (p.size() > prefix.size() &&
+            _wcsnicmp(p.c_str(), prefix.c_str(), prefix.size()) == 0) {
+            filteredExclusions_.insert(p.substr(prefix.size()));
+        }
+    }
+}
+
+// ---------- Event handlers ----------
+
 void MainWindow::OnDriveSelChanged() {
     int sel = static_cast<int>(SendMessageW(hDriveCombo_, CB_GETCURSEL, 0, 0));
     if (sel >= 0 && sel < static_cast<int>(drives_.size())) {
@@ -342,7 +600,27 @@ void MainWindow::OnDriveSelChanged() {
         SendMessageW(hDriveCombo_, CB_INSERTSTRING, sel,
             reinterpret_cast<LPARAM>(drives_[sel].displayString.c_str()));
         SendMessageW(hDriveCombo_, CB_SETCURSEL, sel, 0);
-        UpdateStatusBar();
+
+        // Load transfer log for selected drive
+        std::wstring serialHex = TransferLog::FormatSerial(drives_[sel].serialNumber);
+        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
+        if (logLoaded_) {
+            CancelDriveIndexing();
+            driveIndex_.clear();
+            filteredExclusions_.clear();
+            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
+            UpdateStatusBar();
+        } else {
+            int ret = MessageBoxW(hWnd_,
+                L"No transfer log found for this drive.\n"
+                L"Would you like to index it to detect existing files?",
+                L"DSplit", MB_YESNO | MB_ICONQUESTION);
+            if (ret == IDYES) {
+                StartDriveIndexing();
+            } else {
+                UpdateStatusBar();
+            }
+        }
     }
 }
 
@@ -369,6 +647,13 @@ void MainWindow::OnBrowseFolder() {
                 if (SUCCEEDED(hr) && path) {
                     SetWindowTextW(hSourceEdit_, path);
                     fileTree_.Populate(path);
+
+                    // Apply exclusions from drive index (if available and no log)
+                    if (!logLoaded_ && !driveIndex_.empty()) {
+                        BuildFilteredExclusions();
+                        fileTree_.SetExcludedPaths(&filteredExclusions_);
+                    }
+
                     UpdateStatusBar();
                     CoTaskMemFree(path);
                 }
@@ -460,20 +745,34 @@ void MainWindow::StartMigration(bool moveMode) {
     std::wstring destRoot = Utils::CombinePaths(
         drives_[selectedDriveIndex_].rootPath, folderName);
 
+    std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
+
     MigrationParams params;
     params.hWndNotify = hWnd_;
     params.destRoot = destRoot;
     params.moveMode = moveMode;
+    params.verifyBeforeDelete = moveMode &&
+        (SendMessageW(hVerifyCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED);
     params.totalBytes = selectedSize;
+    std::wstring logFileName = L"DSplit_" + serialHex + L".log";
+    params.logFilePath = Utils::CombinePaths(
+        Utils::CombinePaths(exeDir_, L"logs"), logFileName);
+    params.destLogFilePath = Utils::CombinePaths(
+        drives_[selectedDriveIndex_].rootPath, logFileName);
+    params.logVolumeName = drives_[selectedDriveIndex_].volumeName;
+    params.logDriveLetter = drives_[selectedDriveIndex_].driveLetter;
+    params.logSerialHex = serialHex;
 
     for (auto& f : selectedFiles) {
         MigrationItem item;
         item.sourcePath = f.sourcePath;
         item.relativePath = f.relativePath;
+        item.fileSize = f.size;
         item.isDirectory = f.isDirectory;
         params.items.push_back(std::move(item));
     }
 
+    migrationTotalBytes_ = selectedSize;
     SetOperationInProgress(true);
     migration_.Start(params);
 }
@@ -508,6 +807,7 @@ void MainWindow::UpdateStatusBar() {
 void MainWindow::SetOperationInProgress(bool inProgress) {
     ShowWindow(hProgressBar_, inProgress ? SW_SHOW : SW_HIDE);
     ShowWindow(hProgressLabel_, inProgress ? SW_SHOW : SW_HIDE);
+    ShowWindow(hSpeedLabel_, inProgress ? SW_SHOW : SW_HIDE);
     ShowWindow(hCancelBtn_, inProgress ? SW_SHOW : SW_HIDE);
 
     EnableWindow(hDriveCombo_, !inProgress);
@@ -517,15 +817,45 @@ void MainWindow::SetOperationInProgress(bool inProgress) {
     EnableWindow(hAutoSelectBtn_, !inProgress);
     EnableWindow(hCopyBtn_, !inProgress);
     EnableWindow(hMoveBtn_, !inProgress);
+    EnableWindow(hVerifyCheck_, !inProgress);
 
     if (inProgress) {
         SendMessageW(hProgressBar_, PBM_SETPOS, 0, 0);
         SetWindowTextW(hProgressLabel_, L"Starting...");
+        SetWindowTextW(hSpeedLabel_, L"");
+        migrationStartTick_ = GetTickCount64();
     }
 }
 
 void MainWindow::OnMigrationProgress(int progress) {
     SendMessageW(hProgressBar_, PBM_SETPOS, progress, 0);
+
+    // Calculate transfer speed from elapsed time and progress
+    ULONGLONG elapsed = GetTickCount64() - migrationStartTick_;
+    if (elapsed > 500 && progress > 0 && migrationTotalBytes_ > 0) {
+        double bytesTransferred = (static_cast<double>(progress) / 1000.0) * migrationTotalBytes_;
+        double seconds = elapsed / 1000.0;
+        double bytesPerSec = bytesTransferred / seconds;
+
+        // Format speed + percentage
+        std::wstring speed = Utils::FormatSizeShort(static_cast<uint64_t>(bytesPerSec)) + L"/s";
+
+        // ETA
+        double remaining = migrationTotalBytes_ - bytesTransferred;
+        int etaSec = (bytesPerSec > 0) ? static_cast<int>(remaining / bytesPerSec) : 0;
+        if (etaSec > 0) {
+            int mins = etaSec / 60;
+            int secs = etaSec % 60;
+            wchar_t etaBuf[32];
+            if (mins > 0)
+                swprintf_s(etaBuf, L"  ETA %d:%02d", mins, secs);
+            else
+                swprintf_s(etaBuf, L"  ETA %ds", secs);
+            speed += etaBuf;
+        }
+
+        SetWindowTextW(hSpeedLabel_, speed.c_str());
+    }
 }
 
 void MainWindow::OnMigrationFile(const wchar_t* filename) {
@@ -534,6 +864,16 @@ void MainWindow::OnMigrationFile(const wchar_t* filename) {
 
 void MainWindow::OnMigrationComplete(int status) {
     SetOperationInProgress(false);
+
+    // End transfer logging and reload log
+    transferLog_.EndLogging();
+    if (selectedDriveIndex_ >= 0) {
+        std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
+        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
+        if (logLoaded_) {
+            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
+        }
+    }
 
     // Refresh drive info
     if (selectedDriveIndex_ >= 0) {

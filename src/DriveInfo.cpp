@@ -32,10 +32,12 @@ std::vector<DriveEntry> EnumerateDrives() {
         // Drive letter (strip trailing backslash)
         entry.driveLetter = entry.rootPath.substr(0, 2);
 
-        // Volume name
+        // Volume name and serial number
         wchar_t volName[MAX_PATH + 1] = {};
-        if (GetVolumeInformationW(p, volName, MAX_PATH + 1, nullptr, nullptr, nullptr, nullptr, 0)) {
+        DWORD serialNumber = 0;
+        if (GetVolumeInformationW(p, volName, MAX_PATH + 1, &serialNumber, nullptr, nullptr, nullptr, 0)) {
             entry.volumeName = volName;
+            entry.serialNumber = serialNumber;
         }
 
         // Free space

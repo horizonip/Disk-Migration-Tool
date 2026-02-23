@@ -3,9 +3,12 @@
 #include <commctrl.h>
 #include <string>
 #include <vector>
+#include <unordered_set>
+#include <atomic>
 #include "DriveInfo.h"
 #include "FileTree.h"
 #include "Migration.h"
+#include "TransferLog.h"
 
 // Control IDs
 #define IDC_DRIVE_COMBO     1001
@@ -22,9 +25,12 @@
 #define IDC_PROGRESS_BAR    1012
 #define IDC_PROGRESS_LABEL  1013
 #define IDC_CANCEL_BTN      1014
+#define IDC_SPEED_LABEL     1015
+#define IDC_VERIFY_CHECK    1016
 
-// Custom message for deferred checkbox handling
+// Custom messages
 #define WM_TREE_CHECK_CHANGED (WM_USER + 200)
+#define WM_INDEXING_COMPLETE  (WM_USER + 201)
 
 class MainWindow {
 public:
@@ -57,6 +63,12 @@ private:
     void OnMigrationComplete(int status);
     void OnMigrationError(const wchar_t* errorMsg);
 
+    // Drive indexing
+    void StartDriveIndexing();
+    void CancelDriveIndexing();
+    void OnIndexingComplete();
+    void BuildFilteredExclusions();
+
     HWND hWnd_ = nullptr;
     HINSTANCE hInstance_ = nullptr;
     HFONT hFont_ = nullptr;
@@ -75,15 +87,28 @@ private:
     HWND hAutoSelectBtn_ = nullptr;
     HWND hCopyBtn_ = nullptr;
     HWND hMoveBtn_ = nullptr;
+    HWND hVerifyCheck_ = nullptr;
     HWND hProgressBar_ = nullptr;
     HWND hProgressLabel_ = nullptr;
+    HWND hSpeedLabel_ = nullptr;
     HWND hCancelBtn_ = nullptr;
 
     // Data
     std::vector<DriveEntry> drives_;
     FileTree fileTree_;
     Migration migration_;
+    TransferLog transferLog_;
+    bool logLoaded_ = false;
+    std::wstring exeDir_;
     int selectedDriveIndex_ = -1;
+    ULONGLONG migrationStartTick_ = 0;
+    uint64_t migrationTotalBytes_ = 0;
+
+    // Drive indexing (background thread)
+    HANDLE hIndexThread_ = nullptr;
+    std::unordered_set<std::wstring> driveIndex_;
+    std::unordered_set<std::wstring> filteredExclusions_;
+    std::atomic<bool> indexCancelled_{false};
 
     static const wchar_t* CLASS_NAME;
 };

@@ -222,6 +222,10 @@ void FileTree::CollectLeaves(HTREEITEM hItem, std::vector<LeafItem>& leaves) {
     }
 }
 
+void FileTree::SetExcludedPaths(const std::unordered_set<std::wstring>* excluded) {
+    excludedPaths_ = excluded;
+}
+
 void FileTree::AutoSelect(uint64_t availableBytes) {
     suppressCheckHandling_ = true;
     SendMessageW(hTree_, WM_SETREDRAW, FALSE, 0);
@@ -246,6 +250,13 @@ void FileTree::AutoSelect(uint64_t availableBytes) {
     // Greedy select until we exceed available space
     uint64_t cumulative = 0;
     for (auto& leaf : leaves) {
+        // Skip files already on destination
+        if (excludedPaths_) {
+            auto it = itemMap_.find(leaf.hItem);
+            if (it != itemMap_.end() && excludedPaths_->count(it->second.relativePath)) {
+                continue;
+            }
+        }
         if (cumulative + leaf.size > availableBytes) {
             continue; // skip files that don't fit, try smaller ones
         }
@@ -281,6 +292,7 @@ void FileTree::CollectCheckedFiles(HTREEITEM hItem, std::vector<SelectedFile>& f
         SelectedFile sf;
         sf.sourcePath = it->second.fullPath;
         sf.relativePath = it->second.relativePath;
+        sf.size = it->second.size;
         sf.isDirectory = it->second.isDirectory;
         files.push_back(sf);
     }
