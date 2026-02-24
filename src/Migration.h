@@ -11,25 +11,31 @@
 #define WM_MIGRATION_COMPLETE   (WM_USER + 102)
 #define WM_MIGRATION_ERROR      (WM_USER + 103)
 
+struct DestinationDriveInfo {
+    std::wstring rootPath;      // e.g. "D:\\"
+    std::wstring serialHex;     // e.g. "A1B2C3D4"
+    std::wstring volumeName;    // e.g. "Backup"
+    std::wstring driveLetter;   // e.g. "D:"
+};
+
 struct MigrationItem {
     std::wstring sourcePath;
     std::wstring relativePath;
     uint64_t fileSize;
     bool isDirectory;
+    int destDriveIndex;         // index into MigrationParams::drives
 };
 
 struct MigrationParams {
-    HWND hWndNotify;                    // Window to post progress messages to
-    std::wstring destRoot;              // Destination root path
-    std::vector<MigrationItem> items;   // Files/folders to process
-    bool moveMode;                      // true = move, false = copy
-    bool verifyBeforeDelete;            // verify copy matches source before deleting
-    uint64_t totalBytes;                // Total bytes to transfer
-    std::wstring logFilePath;           // Local log: {exe}\logs\DSplit_{serial}.log
-    std::wstring destLogFilePath;       // Drive root log: {drive}\DSplit_{serial}.log
-    std::wstring logVolumeName;         // For log header (e.g. "Backup")
-    std::wstring logDriveLetter;        // For log header (e.g. "D:")
-    std::wstring logSerialHex;          // For log header (e.g. "A1B2C3D4")
+    HWND hWndNotify;                            // Window to post progress messages to
+    std::wstring sourcePath;                    // Source root path
+    std::wstring sourceFolderName;              // Source folder basename
+    std::vector<DestinationDriveInfo> drives;   // Destination drives
+    std::vector<MigrationItem> items;           // Files/folders to process
+    bool moveMode;                              // true = move, false = copy
+    bool verifyBeforeDelete;                    // verify copy matches source before deleting
+    uint64_t totalBytes;                        // Total bytes to transfer
+    std::wstring jsonLogPath;                   // Path to JSON transfer log
 };
 
 class Migration {

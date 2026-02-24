@@ -9,126 +9,8 @@ const wchar_t* MainWindow::CLASS_NAME = L"DSplitMainWindow";
 static const int MARGIN = 12;
 static const int CONTROL_HEIGHT = 24;
 static const int BUTTON_HEIGHT = 28;
-static const int BUTTON_WIDTH = 120;
 static const int LABEL_HEIGHT = 18;
-
-// ---------- Background drive indexing ----------
-
-struct IndexThreadData {
-    std::wstring driveRoot;
-    std::unordered_set<std::wstring>* resultSet;
-    std::atomic<bool>* cancelled;
-    HWND hWndNotify;
-    // Log file info
-    std::wstring logFilePath;       // Local log: {exe}\logs\DSplit_{serial}.log
-    std::wstring destLogFilePath;   // Drive root log: {drive}\DSplit_{serial}.log
-    std::wstring logFileName;       // Just the filename to skip during scan
-    std::wstring volumeName;
-    std::wstring driveLetter;
-    std::wstring serialHex;
-};
-
-static void WriteToLogs(HANDLE hLog, HANDLE hDestLog, const std::wstring& line) {
-    Utils::WriteLogLine(hLog, line);
-    Utils::WriteLogLine(hDestLog, line);
-}
-
-static void ScanDriveRecursive(const std::wstring& basePath, const std::wstring& relPrefix,
-                                std::unordered_set<std::wstring>& results,
-                                std::atomic<bool>& cancelled,
-                                HANDLE hLog, HANDLE hDestLog,
-                                const std::wstring& skipFileName) {
-    if (cancelled) return;
-
-    std::wstring searchPath = basePath;
-    if (!searchPath.empty() && searchPath.back() != L'\\') searchPath += L'\\';
-    searchPath += L'*';
-
-    WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
-
-    do {
-        if (cancelled) break;
-        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0)
-            continue;
-
-        // Skip system entries at drive root (e.g. $Recycle.Bin, System Volume Information)
-        if (relPrefix.empty() && (fd.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM))
-            continue;
-
-        // Skip the log file itself at drive root
-        if (relPrefix.empty() && !skipFileName.empty() &&
-            _wcsicmp(fd.cFileName, skipFileName.c_str()) == 0)
-            continue;
-
-        std::wstring relPath = relPrefix.empty()
-            ? std::wstring(fd.cFileName)
-            : relPrefix + L"\\" + fd.cFileName;
-
-        std::wstring fullPath = basePath;
-        if (!fullPath.empty() && fullPath.back() != L'\\') fullPath += L'\\';
-        fullPath += fd.cFileName;
-
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            results.insert(relPath + L"\\");
-            WriteToLogs(hLog, hDestLog, relPath + L"\\");
-            ScanDriveRecursive(fullPath, relPath, results, cancelled, hLog, hDestLog, skipFileName);
-        } else {
-            results.insert(relPath);
-            WriteToLogs(hLog, hDestLog, relPath);
-        }
-    } while (FindNextFileW(hFind, &fd));
-
-    FindClose(hFind);
-}
-
-static HANDLE OpenLogForWrite(const std::wstring& path, const std::wstring& volumeName,
-                               const std::wstring& driveLetter, const std::wstring& serialHex) {
-    if (path.empty()) return INVALID_HANDLE_VALUE;
-
-    size_t sep = path.find_last_of(L"\\/");
-    if (sep != std::wstring::npos) {
-        Utils::EnsureDirectoryExists(path.substr(0, sep));
-    }
-
-    HANDLE h = CreateFileW(path.c_str(),
-        GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-    if (h != INVALID_HANDLE_VALUE) {
-        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-        DWORD written;
-        WriteFile(h, bom, 3, &written, nullptr);
-        Utils::WriteLogLine(h, L"# DSplit Transfer Log");
-        Utils::WriteLogLine(h, L"# Volume: " + volumeName +
-                                   L" (" + driveLetter + L")");
-        Utils::WriteLogLine(h, L"# Serial: " + serialHex);
-    }
-    return h;
-}
-
-static DWORD WINAPI IndexThreadProc(LPVOID param) {
-    auto* data = static_cast<IndexThreadData*>(param);
-
-    // Open local log file ({exe}\logs\DSplit_{serial}.log)
-    HANDLE hLog = OpenLogForWrite(data->logFilePath,
-        data->volumeName, data->driveLetter, data->serialHex);
-
-    // Open destination drive root log ({drive}\DSplit_{serial}.log)
-    HANDLE hDestLog = OpenLogForWrite(data->destLogFilePath,
-        data->volumeName, data->driveLetter, data->serialHex);
-
-    ScanDriveRecursive(data->driveRoot, L"", *data->resultSet, *data->cancelled,
-        hLog, hDestLog, data->logFileName);
-
-    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
-    if (hDestLog != INVALID_HANDLE_VALUE) CloseHandle(hDestLog);
-
-    PostMessageW(data->hWndNotify, WM_INDEXING_COMPLETE, 0, 0);
-    delete data;
-    return 0;
-}
+static const int SPLITTER_GAP = 12;
 
 // ---------- Window registration & creation ----------
 
@@ -150,7 +32,7 @@ HWND MainWindow::Create(HINSTANCE hInstance) {
     HWND hWnd = CreateWindowExW(
         0, CLASS_NAME, L"DSplit \u2014 Disk Migration Tool",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 650,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1100, 750,
         nullptr, nullptr, hInstance, nullptr);
     return hWnd;
 }
@@ -179,7 +61,28 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         return 0;
 
     case WM_NOTIFY:
-        if (self) self->OnNotify(reinterpret_cast<NMHDR*>(lParam));
+        if (self) {
+            auto* pnm = reinterpret_cast<NMHDR*>(lParam);
+            self->OnNotify(pnm);
+
+            // Handle custom draw for source tree (dim transferred files)
+            if (pnm->idFrom == IDC_FILE_TREE && pnm->code == NM_CUSTOMDRAW) {
+                auto* cd = reinterpret_cast<NMTVCUSTOMDRAW*>(lParam);
+                switch (cd->nmcd.dwDrawStage) {
+                case CDDS_PREPAINT:
+                    return CDRF_NOTIFYITEMDRAW;
+                case CDDS_ITEMPREPAINT: {
+                    HTREEITEM hItem = reinterpret_cast<HTREEITEM>(cd->nmcd.dwItemSpec);
+                    auto& itemMap = self->fileTree_.GetItemMap();
+                    auto it = itemMap.find(hItem);
+                    if (it != itemMap.end() && self->fileTree_.IsTransferred(it->second.relativePath)) {
+                        cd->clrText = GetSysColor(COLOR_GRAYTEXT);
+                    }
+                    return CDRF_DODEFAULT;
+                }
+                }
+            }
+        }
         return 0;
 
     case WM_MIGRATION_PROGRESS:
@@ -210,17 +113,12 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
         if (self) {
             HTREEITEM hItem = reinterpret_cast<HTREEITEM>(lParam);
             self->fileTree_.OnCheckChanged(hItem);
-            self->UpdateStatusBar();
+            self->UpdateAssignments();
         }
-        return 0;
-
-    case WM_INDEXING_COMPLETE:
-        if (self) self->OnIndexingComplete();
         return 0;
 
     case WM_DESTROY:
         if (self) {
-            self->CancelDriveIndexing();
             if (self->hFont_) DeleteObject(self->hFont_);
             delete self;
             SetWindowLongPtrW(hWnd, GWLP_USERDATA, 0);
@@ -263,19 +161,14 @@ void MainWindow::OnCreate(HWND hWnd) {
         return h;
     };
 
-    // Destination drive section
-    hDriveLabel_ = createCtrl(L"STATIC", L"Destination Drive:", SS_LEFT, 0);
-    hDriveCombo_ = createCtrl(L"COMBOBOX", L"",
-        CBS_DROPDOWNLIST | WS_VSCROLL, IDC_DRIVE_COMBO);
-
-    // Source folder section
+    // --- Left side: Source ---
     hSourceLabel_ = createCtrl(L"STATIC", L"Source Folder:", SS_LEFT, 0);
     hSourceEdit_ = createCtrl(L"EDIT", L"",
         ES_AUTOHSCROLL | ES_READONLY | WS_BORDER, IDC_SOURCE_EDIT);
     hBrowseBtn_ = createCtrl(L"BUTTON", L"Browse...",
         BS_PUSHBUTTON, IDC_BROWSE_BTN);
 
-    // File TreeView
+    // Source File TreeView
     hTreeView_ = CreateWindowExW(
         WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
@@ -286,8 +179,26 @@ void MainWindow::OnCreate(HWND hWnd) {
     SendMessageW(hTreeView_, WM_SETFONT, reinterpret_cast<WPARAM>(hFont_), TRUE);
     fileTree_.SetTreeView(hTreeView_);
 
-    // Status bar
-    hStatusLabel_ = createCtrl(L"STATIC", L"Selected: 0 bytes / 0 bytes available",
+    // --- Right side: Destination ---
+    hDestLabel_ = createCtrl(L"STATIC", L"Destination Drives:", SS_LEFT, 0);
+    hAddDriveBtn_ = createCtrl(L"BUTTON", L"Add Drive",
+        BS_PUSHBUTTON, IDC_ADD_DRIVE_BTN);
+    hRemoveDriveBtn_ = createCtrl(L"BUTTON", L"Remove",
+        BS_PUSHBUTTON, IDC_REMOVE_DRIVE_BTN);
+
+    // Destination TreeView (no checkboxes — display only)
+    hDestTreeView_ = CreateWindowExW(
+        WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+        TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT,
+        0, 0, 0, 0,
+        hWnd, reinterpret_cast<HMENU>(IDC_DEST_TREE),
+        hInstance_, nullptr);
+    SendMessageW(hDestTreeView_, WM_SETFONT, reinterpret_cast<WPARAM>(hFont_), TRUE);
+    destTree_.SetTreeView(hDestTreeView_);
+
+    // --- Bottom: shared controls ---
+    hStatusLabel_ = createCtrl(L"STATIC", L"Select source folder and add destination drives",
         SS_LEFT, IDC_STATUS_LABEL);
     hCapacityBar_ = CreateWindowExW(0, PROGRESS_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
@@ -309,9 +220,9 @@ void MainWindow::OnCreate(HWND hWnd) {
         BS_PUSHBUTTON, IDC_MOVE_BTN);
     hVerifyCheck_ = createCtrl(L"BUTTON", L"Verify before delete",
         BS_AUTOCHECKBOX, IDC_VERIFY_CHECK);
-    SendMessageW(hVerifyCheck_, BM_SETCHECK, BST_CHECKED, 0); // on by default
+    SendMessageW(hVerifyCheck_, BM_SETCHECK, BST_CHECKED, 0);
 
-    // Progress section
+    // Progress section (hidden by default)
     hProgressBar_ = CreateWindowExW(0, PROGRESS_CLASSW, L"",
         WS_CHILD | PBS_SMOOTH,
         0, 0, 0, 0,
@@ -340,80 +251,77 @@ void MainWindow::OnCreate(HWND hWnd) {
         hInstance_, nullptr);
     SendMessageW(hCancelBtn_, WM_SETFONT, reinterpret_cast<WPARAM>(hFont_), TRUE);
 
-    // Populate drives
-    drives_ = DriveInfo::EnumerateDrives();
-    for (size_t i = 0; i < drives_.size(); i++) {
-        SendMessageW(hDriveCombo_, CB_ADDSTRING, 0,
-            reinterpret_cast<LPARAM>(drives_[i].displayString.c_str()));
-    }
-    if (!drives_.empty()) {
-        SendMessageW(hDriveCombo_, CB_SETCURSEL, 0, 0);
-        selectedDriveIndex_ = 0;
-
-        // Load transfer log for initial drive (no popup on startup)
-        std::wstring serialHex = TransferLog::FormatSerial(drives_[0].serialNumber);
-        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
-        if (logLoaded_) {
-            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
-        }
-    }
-
     // Trigger initial layout
     RECT rc;
     GetClientRect(hWnd, &rc);
     OnSize(rc.right, rc.bottom);
-    UpdateStatusBar();
 }
 
 void MainWindow::OnSize(int width, int height) {
     if (width == 0 || height == 0) return;
 
-    int x = MARGIN;
-    int y = MARGIN;
     int contentWidth = width - 2 * MARGIN;
+    int halfWidth = (contentWidth - SPLITTER_GAP) / 2;
 
-    // Drive label
-    MoveWindow(hDriveLabel_, x, y, contentWidth, LABEL_HEIGHT, TRUE);
+    int leftX = MARGIN;
+    int rightX = MARGIN + halfWidth + SPLITTER_GAP;
+
+    int y = MARGIN;
+
+    // --- Left column: Source ---
+    MoveWindow(hSourceLabel_, leftX, y, halfWidth, LABEL_HEIGHT, TRUE);
+
+    // --- Right column: Destination label + buttons ---
+    int addBtnWidth = 80;
+    int rmBtnWidth = 70;
+    int labelWidth = halfWidth - addBtnWidth - rmBtnWidth - 12;
+    MoveWindow(hDestLabel_, rightX, y, labelWidth, LABEL_HEIGHT, TRUE);
+    MoveWindow(hAddDriveBtn_, rightX + labelWidth + 6, y - 3, addBtnWidth, CONTROL_HEIGHT, TRUE);
+    MoveWindow(hRemoveDriveBtn_, rightX + labelWidth + 6 + addBtnWidth + 4, y - 3, rmBtnWidth, CONTROL_HEIGHT, TRUE);
+
     y += LABEL_HEIGHT + 4;
 
-    // Drive combo
-    MoveWindow(hDriveCombo_, x, y, contentWidth, CONTROL_HEIGHT * 8, TRUE);
-    y += CONTROL_HEIGHT + MARGIN;
-
-    // Source label
-    MoveWindow(hSourceLabel_, x, y, contentWidth, LABEL_HEIGHT, TRUE);
-    y += LABEL_HEIGHT + 4;
+    // Right side: dest tree starts here (no edit row on right side)
+    int destTreeTop = y;
 
     // Source edit + browse button
     int browseWidth = 80;
-    MoveWindow(hSourceEdit_, x, y, contentWidth - browseWidth - 6, CONTROL_HEIGHT, TRUE);
-    MoveWindow(hBrowseBtn_, x + contentWidth - browseWidth, y, browseWidth, CONTROL_HEIGHT, TRUE);
+    MoveWindow(hSourceEdit_, leftX, y, halfWidth - browseWidth - 6, CONTROL_HEIGHT, TRUE);
+    MoveWindow(hBrowseBtn_, leftX + halfWidth - browseWidth, y, browseWidth, CONTROL_HEIGHT, TRUE);
     y += CONTROL_HEIGHT + MARGIN;
 
-    // Calculate remaining space for tree
+    // Calculate remaining space for trees
     int bottomSectionHeight = LABEL_HEIGHT + 4 + 8 + BUTTON_HEIGHT + MARGIN +
                                CONTROL_HEIGHT + LABEL_HEIGHT + MARGIN + MARGIN;
     int treeHeight = height - y - bottomSectionHeight;
     if (treeHeight < 100) treeHeight = 100;
 
-    MoveWindow(hTreeView_, x, y, contentWidth, treeHeight, TRUE);
+    int destTreeHeight = treeHeight + (y - destTreeTop); // dest tree is taller
+
+    // Source tree (left)
+    MoveWindow(hTreeView_, leftX, y, halfWidth, treeHeight, TRUE);
+
+    // Dest tree (right) — starts above source tree since no edit row
+    MoveWindow(hDestTreeView_, rightX, destTreeTop, halfWidth, destTreeHeight, TRUE);
+
     y += treeHeight + MARGIN;
 
+    // --- Full-width bottom section ---
     // Status label + capacity bar
-    MoveWindow(hStatusLabel_, x, y, contentWidth, LABEL_HEIGHT, TRUE);
+    MoveWindow(hStatusLabel_, MARGIN, y, contentWidth, LABEL_HEIGHT, TRUE);
     y += LABEL_HEIGHT + 4;
-    MoveWindow(hCapacityBar_, x, y, contentWidth, 8, TRUE);
+    MoveWindow(hCapacityBar_, MARGIN, y, contentWidth, 8, TRUE);
     y += 8 + MARGIN;
 
     // Action buttons row
     int btnSpacing = 6;
-    int bx = x;
+    int bx = MARGIN;
     MoveWindow(hSelectAllBtn_, bx, y, 80, BUTTON_HEIGHT, TRUE);
     bx += 80 + btnSpacing;
     MoveWindow(hDeselectAllBtn_, bx, y, 90, BUTTON_HEIGHT, TRUE);
     bx += 90 + btnSpacing;
     MoveWindow(hAutoSelectBtn_, bx, y, 90, BUTTON_HEIGHT, TRUE);
-    bx += 90 + btnSpacing + 20; // extra gap before action buttons
+    bx += 90 + btnSpacing + 20;
     int actionBtnWidth = 140;
     MoveWindow(hCopyBtn_, bx, y, actionBtnWidth, BUTTON_HEIGHT, TRUE);
     bx += actionBtnWidth + btnSpacing;
@@ -424,19 +332,16 @@ void MainWindow::OnSize(int width, int height) {
 
     // Progress bar + label + cancel
     int cancelWidth = 70;
-    MoveWindow(hProgressBar_, x, y, contentWidth - cancelWidth - 6, CONTROL_HEIGHT, TRUE);
-    MoveWindow(hCancelBtn_, x + contentWidth - cancelWidth, y, cancelWidth, CONTROL_HEIGHT, TRUE);
+    MoveWindow(hProgressBar_, MARGIN, y, contentWidth - cancelWidth - 6, CONTROL_HEIGHT, TRUE);
+    MoveWindow(hCancelBtn_, MARGIN + contentWidth - cancelWidth, y, cancelWidth, CONTROL_HEIGHT, TRUE);
     y += CONTROL_HEIGHT + 2;
     int speedWidth = 160;
-    MoveWindow(hProgressLabel_, x, y, contentWidth - speedWidth - 6, LABEL_HEIGHT, TRUE);
-    MoveWindow(hSpeedLabel_, x + contentWidth - speedWidth, y, speedWidth, LABEL_HEIGHT, TRUE);
+    MoveWindow(hProgressLabel_, MARGIN, y, contentWidth - speedWidth - 6, LABEL_HEIGHT, TRUE);
+    MoveWindow(hSpeedLabel_, MARGIN + contentWidth - speedWidth, y, speedWidth, LABEL_HEIGHT, TRUE);
 }
 
 void MainWindow::OnCommand(WORD id, WORD code) {
     switch (id) {
-    case IDC_DRIVE_COMBO:
-        if (code == CBN_SELCHANGE) OnDriveSelChanged();
-        break;
     case IDC_BROWSE_BTN:
         OnBrowseFolder();
         break;
@@ -458,6 +363,12 @@ void MainWindow::OnCommand(WORD id, WORD code) {
     case IDC_CANCEL_BTN:
         OnCancel();
         break;
+    case IDC_ADD_DRIVE_BTN:
+        OnAddDrive();
+        break;
+    case IDC_REMOVE_DRIVE_BTN:
+        OnRemoveDrive();
+        break;
     }
 }
 
@@ -472,7 +383,6 @@ void MainWindow::OnNotify(NMHDR* pnm) {
             ScreenToClient(hTreeView_, &ht.pt);
             HTREEITEM hItem = TreeView_HitTest(hTreeView_, &ht);
             if (hItem && (ht.flags & TVHT_ONITEMSTATEICON)) {
-                // Post a message to handle after the state has changed
                 PostMessageW(hWnd_, WM_TREE_CHECK_CHANGED, 0,
                     reinterpret_cast<LPARAM>(hItem));
             }
@@ -489,140 +399,165 @@ void MainWindow::OnNotify(NMHDR* pnm) {
     }
 }
 
-// ---------- Drive indexing ----------
+// ---------- Drive management ----------
 
-void MainWindow::StartDriveIndexing() {
-    CancelDriveIndexing();
-    driveIndex_.clear();
-    filteredExclusions_.clear();
-    fileTree_.SetExcludedPaths(nullptr);
+void MainWindow::OnAddDrive() {
+    // Enumerate all drives
+    auto allDrives = DriveInfo::EnumerateDrives();
 
-    if (selectedDriveIndex_ < 0) return;
-
-    indexCancelled_ = false;
-
-    std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
-
-    std::wstring logFileName = L"DSplit_" + serialHex + L".log";
-
-    auto* data = new IndexThreadData();
-    data->driveRoot = drives_[selectedDriveIndex_].rootPath;
-    data->resultSet = &driveIndex_;
-    data->cancelled = &indexCancelled_;
-    data->hWndNotify = hWnd_;
-    data->logFilePath = Utils::CombinePaths(
-        Utils::CombinePaths(exeDir_, L"logs"), logFileName);
-    data->destLogFilePath = Utils::CombinePaths(
-        drives_[selectedDriveIndex_].rootPath, logFileName);
-    data->logFileName = logFileName;
-    data->volumeName = drives_[selectedDriveIndex_].volumeName;
-    data->driveLetter = drives_[selectedDriveIndex_].driveLetter;
-    data->serialHex = serialHex;
-
-    hIndexThread_ = CreateThread(nullptr, 0, IndexThreadProc, data, 0, nullptr);
-    if (hIndexThread_) {
-        SetWindowTextW(hStatusLabel_, L"Indexing destination drive...");
-        EnableWindow(hAutoSelectBtn_, FALSE);
-        EnableWindow(hCopyBtn_, FALSE);
-        EnableWindow(hMoveBtn_, FALSE);
-    } else {
-        delete data;
-    }
-}
-
-void MainWindow::CancelDriveIndexing() {
-    if (hIndexThread_) {
-        indexCancelled_ = true;
-        WaitForSingleObject(hIndexThread_, 5000);
-        CloseHandle(hIndexThread_);
-        hIndexThread_ = nullptr;
-    }
-}
-
-void MainWindow::OnIndexingComplete() {
-    if (hIndexThread_) {
-        CloseHandle(hIndexThread_);
-        hIndexThread_ = nullptr;
-    }
-
-    EnableWindow(hAutoSelectBtn_, TRUE);
-    EnableWindow(hCopyBtn_, TRUE);
-    EnableWindow(hMoveBtn_, TRUE);
-
-    // Reload the log that was just written so logLoaded_ is set
-    if (selectedDriveIndex_ >= 0) {
-        std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
-        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
-    }
-
-    // If a source folder is already loaded, build exclusions now
-    if (!fileTree_.GetSourceFolder().empty()) {
-        BuildFilteredExclusions();
-        fileTree_.SetExcludedPaths(&filteredExclusions_);
-    }
-
-    UpdateStatusBar();
-}
-
-void MainWindow::BuildFilteredExclusions() {
-    filteredExclusions_.clear();
-
+    // Filter out already-added drives and the source drive
     std::wstring sourceFolder = fileTree_.GetSourceFolder();
-    if (sourceFolder.empty() || driveIndex_.empty()) return;
+    std::wstring sourceDriveLetter;
+    if (sourceFolder.size() >= 2) {
+        sourceDriveLetter = sourceFolder.substr(0, 2);
+    }
 
-    // Extract source folder name
-    std::wstring folderName;
-    size_t lastSep = sourceFolder.find_last_of(L"\\/");
-    if (lastSep != std::wstring::npos)
-        folderName = sourceFolder.substr(lastSep + 1);
-    else
-        folderName = sourceFolder;
+    std::vector<DriveEntry> available;
+    for (auto& d : allDrives) {
+        // Skip source drive
+        if (!sourceDriveLetter.empty() &&
+            _wcsicmp(d.driveLetter.c_str(), sourceDriveLetter.c_str()) == 0)
+            continue;
 
-    // Filter driveIndex_ paths under folderName\, strip the prefix
-    std::wstring prefix = folderName + L"\\";
-    for (const auto& p : driveIndex_) {
-        if (p.size() > prefix.size() &&
-            _wcsnicmp(p.c_str(), prefix.c_str(), prefix.size()) == 0) {
-            filteredExclusions_.insert(p.substr(prefix.size()));
+        // Skip already-added drives
+        bool alreadyAdded = false;
+        for (int i = 0; i < destTree_.GetDriveCount(); i++) {
+            if (destTree_.GetDrive(i).serialNumber == d.serialNumber &&
+                destTree_.GetDrive(i).driveLetter == d.driveLetter) {
+                alreadyAdded = true;
+                break;
+            }
+        }
+        if (!alreadyAdded) {
+            available.push_back(d);
         }
     }
+
+    if (available.empty()) {
+        MessageBoxW(hWnd_, L"No additional drives available.",
+            L"DSplit", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // Show popup menu at button location
+    HMENU hMenu = CreatePopupMenu();
+    for (size_t i = 0; i < available.size(); i++) {
+        AppendMenuW(hMenu, MF_STRING, 1000 + i, available[i].displayString.c_str());
+    }
+
+    RECT btnRect;
+    GetWindowRect(hAddDriveBtn_, &btnRect);
+    int sel = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_NONOTIFY,
+        btnRect.left, btnRect.bottom, hWnd_, nullptr);
+    DestroyMenu(hMenu);
+
+    if (sel >= 1000 && sel < 1000 + static_cast<int>(available.size())) {
+        destTree_.AddDrive(available[sel - 1000]);
+        UpdateAssignments();
+    }
 }
 
-// ---------- Event handlers ----------
+void MainWindow::OnRemoveDrive() {
+    if (destTree_.GetDriveCount() == 0) return;
 
-void MainWindow::OnDriveSelChanged() {
-    int sel = static_cast<int>(SendMessageW(hDriveCombo_, CB_GETCURSEL, 0, 0));
-    if (sel >= 0 && sel < static_cast<int>(drives_.size())) {
-        selectedDriveIndex_ = sel;
-        DriveInfo::RefreshDriveSpace(drives_[sel]);
-        // Update combo text
-        SendMessageW(hDriveCombo_, CB_DELETESTRING, sel, 0);
-        SendMessageW(hDriveCombo_, CB_INSERTSTRING, sel,
-            reinterpret_cast<LPARAM>(drives_[sel].displayString.c_str()));
-        SendMessageW(hDriveCombo_, CB_SETCURSEL, sel, 0);
+    // Find which drive is selected in the dest tree
+    HTREEITEM hSel = TreeView_GetSelection(hDestTreeView_);
+    if (!hSel) {
+        MessageBoxW(hWnd_, L"Select a drive in the destination tree to remove.",
+            L"DSplit", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
 
-        // Load transfer log for selected drive
-        std::wstring serialHex = TransferLog::FormatSerial(drives_[sel].serialNumber);
-        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
-        if (logLoaded_) {
-            CancelDriveIndexing();
-            driveIndex_.clear();
-            filteredExclusions_.clear();
-            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
-            UpdateStatusBar();
-        } else {
-            int ret = MessageBoxW(hWnd_,
-                L"No transfer log found for this drive.\n"
-                L"Would you like to index it to detect existing files?",
-                L"DSplit", MB_YESNO | MB_ICONQUESTION);
-            if (ret == IDYES) {
-                StartDriveIndexing();
-            } else {
-                UpdateStatusBar();
+    // Walk up to find the drive root node
+    HTREEITEM hRoot = hSel;
+    HTREEITEM hParent;
+    while ((hParent = TreeView_GetParent(hDestTreeView_, hRoot)) != nullptr) {
+        hRoot = hParent;
+    }
+
+    // Find drive index
+    int driveIndex = -1;
+    for (int i = 0; i < destTree_.GetDriveCount(); i++) {
+        if (destTree_.GetDriveNode(i) == hRoot) {
+            driveIndex = i;
+            break;
+        }
+    }
+
+    if (driveIndex < 0) return;
+
+    // Confirm removal
+    std::wstring msg = L"Remove drive " + destTree_.GetDrive(driveIndex).driveLetter + L"?";
+    if (MessageBoxW(hWnd_, msg.c_str(), L"DSplit", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+
+    // Clear assignments for this drive, re-index remaining
+    std::unordered_map<std::wstring, int> newAssignments;
+    for (auto& [path, idx] : assignments_) {
+        if (idx == driveIndex) continue;
+        int newIdx = (idx > driveIndex) ? idx - 1 : idx;
+        newAssignments[path] = newIdx;
+    }
+    assignments_ = std::move(newAssignments);
+
+    destTree_.RemoveDrive(driveIndex);
+    OnAssignmentsChanged();
+}
+
+// ---------- Assignment model ----------
+
+void MainWindow::UpdateAssignments() {
+    assignments_.clear();
+    fileSizes_.clear();
+
+    int driveCount = destTree_.GetDriveCount();
+    if (driveCount == 0) {
+        OnAssignmentsChanged();
+        return;
+    }
+
+    // Get checked files from source tree
+    auto selectedFiles = fileTree_.GetSelectedFiles();
+
+    // Build file sizes map
+    for (auto& f : selectedFiles) {
+        if (!f.isDirectory) {
+            fileSizes_[f.relativePath] = f.size;
+        }
+    }
+
+    // Track available space per drive
+    std::vector<uint64_t> available(driveCount);
+    for (int i = 0; i < driveCount; i++) {
+        available[i] = destTree_.GetDrive(i).freeBytes;
+    }
+
+    // Assign files to drives: skip transferred, assign to first drive with room
+    for (auto& f : selectedFiles) {
+        if (f.isDirectory) continue;
+
+        // Skip already transferred
+        if (transferLog_.Contains(f.relativePath)) continue;
+
+        // Find first drive with enough space
+        for (int i = 0; i < driveCount; i++) {
+            if (f.size <= available[i]) {
+                assignments_[f.relativePath] = i;
+                available[i] -= f.size;
+                break;
             }
         }
     }
+
+    OnAssignmentsChanged();
 }
+
+void MainWindow::OnAssignmentsChanged() {
+    destTree_.Rebuild(assignments_, fileSizes_);
+    UpdateStatusBar();
+}
+
+// ---------- Event handlers ----------
 
 void MainWindow::OnBrowseFolder() {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -646,15 +581,24 @@ void MainWindow::OnBrowseFolder() {
                 hr = psi->GetDisplayName(SIGDN_FILESYSPATH, &path);
                 if (SUCCEEDED(hr) && path) {
                     SetWindowTextW(hSourceEdit_, path);
+
+                    // Clear assignments when source changes
+                    assignments_.clear();
+                    fileSizes_.clear();
+
+                    // Load JSON transfer log for this source
+                    jsonLogPath_ = TransferLog::GetLogPath(exeDir_, path);
+                    transferLog_.Clear();
+                    transferLog_.Load(jsonLogPath_);
+                    transferLog_.SetSourcePath(path);
+
+                    // Set transferred paths for dimming
+                    fileTree_.SetTransferredPaths(&transferLog_.GetPathMap());
+
+                    // Populate source tree
                     fileTree_.Populate(path);
 
-                    // Apply exclusions from drive index (if available and no log)
-                    if (!logLoaded_ && !driveIndex_.empty()) {
-                        BuildFilteredExclusions();
-                        fileTree_.SetExcludedPaths(&filteredExclusions_);
-                    }
-
-                    UpdateStatusBar();
+                    UpdateAssignments();
                     CoTaskMemFree(path);
                 }
                 psi->Release();
@@ -667,23 +611,63 @@ void MainWindow::OnBrowseFolder() {
 
 void MainWindow::OnSelectAll() {
     fileTree_.SelectAll();
-    UpdateStatusBar();
+    UpdateAssignments();
 }
 
 void MainWindow::OnDeselectAll() {
     fileTree_.DeselectAll();
-    UpdateStatusBar();
+    UpdateAssignments();
 }
 
 void MainWindow::OnAutoSelect() {
-    if (selectedDriveIndex_ < 0) {
-        MessageBoxW(hWnd_, L"Please select a destination drive first.",
+    int driveCount = destTree_.GetDriveCount();
+    if (driveCount == 0) {
+        MessageBoxW(hWnd_, L"Please add at least one destination drive.",
             L"DSplit", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    uint64_t available = drives_[selectedDriveIndex_].freeBytes;
-    fileTree_.AutoSelect(available);
-    UpdateStatusBar();
+
+    // Calculate total available across all drives
+    uint64_t totalAvailable = 0;
+    for (int i = 0; i < driveCount; i++) {
+        totalAvailable += destTree_.GetDrive(i).freeBytes;
+    }
+
+    // Deselect all first
+    fileTree_.DeselectAll();
+
+    // Get all leaf files
+    auto leaves = fileTree_.GetAllLeafFiles();
+
+    // Track available space per drive
+    std::vector<uint64_t> available(driveCount);
+    for (int i = 0; i < driveCount; i++) {
+        available[i] = destTree_.GetDrive(i).freeBytes;
+    }
+
+    // Greedy fill across drives
+    SendMessageW(hTreeView_, WM_SETREDRAW, FALSE, 0);
+
+    for (auto& leaf : leaves) {
+        // Skip transferred
+        if (transferLog_.Contains(leaf.relativePath)) continue;
+
+        // Find first drive with space
+        for (int i = 0; i < driveCount; i++) {
+            if (leaf.size <= available[i]) {
+                available[i] -= leaf.size;
+                fileTree_.SetItemChecked(leaf.hItem, true);
+                break;
+            }
+        }
+    }
+
+    fileTree_.PropagateCheckStates();
+
+    SendMessageW(hTreeView_, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hTreeView_, nullptr, TRUE);
+
+    UpdateAssignments();
 }
 
 void MainWindow::OnCopy() {
@@ -710,29 +694,19 @@ void MainWindow::StartMigration(bool moveMode) {
         return;
     }
 
-    if (selectedDriveIndex_ < 0) {
-        MessageBoxW(hWnd_, L"Please select a destination drive.",
+    if (destTree_.GetDriveCount() == 0) {
+        MessageBoxW(hWnd_, L"Please add at least one destination drive.",
             L"DSplit", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    auto selectedFiles = fileTree_.GetSelectedFiles();
-    if (selectedFiles.empty()) {
-        MessageBoxW(hWnd_, L"No files selected.",
+    if (assignments_.empty()) {
+        MessageBoxW(hWnd_, L"No files assigned to destination drives.",
             L"DSplit", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    uint64_t selectedSize = fileTree_.GetSelectedSize();
-    uint64_t available = drives_[selectedDriveIndex_].freeBytes;
-    if (selectedSize > available) {
-        MessageBoxW(hWnd_,
-            L"Selected files exceed available space on destination drive.",
-            L"DSplit", MB_OK | MB_ICONERROR);
-        return;
-    }
-
-    // Build destination path: drive root + source folder name
+    // Build source folder name
     std::wstring sourceFolder = fileTree_.GetSourceFolder();
     std::wstring folderName;
     size_t lastSep = sourceFolder.find_last_of(L"\\/");
@@ -742,62 +716,118 @@ void MainWindow::StartMigration(bool moveMode) {
         folderName = sourceFolder;
     }
 
-    std::wstring destRoot = Utils::CombinePaths(
-        drives_[selectedDriveIndex_].rootPath, folderName);
-
-    std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
-
     MigrationParams params;
     params.hWndNotify = hWnd_;
-    params.destRoot = destRoot;
+    params.sourcePath = sourceFolder;
+    params.sourceFolderName = folderName;
     params.moveMode = moveMode;
     params.verifyBeforeDelete = moveMode &&
         (SendMessageW(hVerifyCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED);
-    params.totalBytes = selectedSize;
-    std::wstring logFileName = L"DSplit_" + serialHex + L".log";
-    params.logFilePath = Utils::CombinePaths(
-        Utils::CombinePaths(exeDir_, L"logs"), logFileName);
-    params.destLogFilePath = Utils::CombinePaths(
-        drives_[selectedDriveIndex_].rootPath, logFileName);
-    params.logVolumeName = drives_[selectedDriveIndex_].volumeName;
-    params.logDriveLetter = drives_[selectedDriveIndex_].driveLetter;
-    params.logSerialHex = serialHex;
+    params.jsonLogPath = jsonLogPath_;
 
+    // Build drives list
+    for (int i = 0; i < destTree_.GetDriveCount(); i++) {
+        const auto& d = destTree_.GetDrive(i);
+        DestinationDriveInfo ddi;
+        ddi.rootPath = d.rootPath;
+        ddi.serialHex = TransferLog::FormatSerial(d.serialNumber);
+        ddi.volumeName = d.volumeName;
+        ddi.driveLetter = d.driveLetter;
+        params.drives.push_back(std::move(ddi));
+    }
+
+    // Build items from selected files + assignments
+    // First pass: collect all checked items (dirs + files)
+    auto selectedFiles = fileTree_.GetSelectedFiles();
+
+    uint64_t totalBytes = 0;
     for (auto& f : selectedFiles) {
         MigrationItem item;
         item.sourcePath = f.sourcePath;
         item.relativePath = f.relativePath;
         item.fileSize = f.size;
         item.isDirectory = f.isDirectory;
+
+        if (f.isDirectory) {
+            // Directories go to all drives that have files in them
+            // We'll set driveIndex = 0 and handle dir creation for all drives
+            item.destDriveIndex = -1; // will be handled specially in migration
+            // Actually, we need to create dirs on all destination drives.
+            // Add a dir item for each drive that has files under this dir.
+            std::unordered_set<int> drivesForDir;
+            for (auto& [path, idx] : assignments_) {
+                // Check if path starts with this dir's relative path
+                if (path.size() > f.relativePath.size() &&
+                    path[f.relativePath.size()] == L'\\' &&
+                    _wcsnicmp(path.c_str(), f.relativePath.c_str(), f.relativePath.size()) == 0) {
+                    drivesForDir.insert(idx);
+                }
+            }
+            for (int driveIdx : drivesForDir) {
+                MigrationItem dirItem;
+                dirItem.sourcePath = f.sourcePath;
+                dirItem.relativePath = f.relativePath;
+                dirItem.fileSize = 0;
+                dirItem.isDirectory = true;
+                dirItem.destDriveIndex = driveIdx;
+                params.items.push_back(std::move(dirItem));
+            }
+            continue;
+        }
+
+        // Look up assignment for this file
+        auto assignIt = assignments_.find(f.relativePath);
+        if (assignIt == assignments_.end()) continue; // not assigned (transferred or no room)
+
+        item.destDriveIndex = assignIt->second;
+        totalBytes += f.size;
         params.items.push_back(std::move(item));
     }
 
-    migrationTotalBytes_ = selectedSize;
+    if (params.items.empty()) {
+        MessageBoxW(hWnd_, L"No files to transfer.",
+            L"DSplit", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    params.totalBytes = totalBytes;
+    migrationTotalBytes_ = totalBytes;
     SetOperationInProgress(true);
     migration_.Start(params);
 }
 
 void MainWindow::UpdateStatusBar() {
     uint64_t selected = fileTree_.GetSelectedSize();
-    uint64_t available = 0;
-    if (selectedDriveIndex_ >= 0) {
-        available = drives_[selectedDriveIndex_].freeBytes;
+    uint64_t assigned = 0;
+    for (auto& [path, idx] : assignments_) {
+        auto sizeIt = fileSizes_.find(path);
+        if (sizeIt != fileSizes_.end()) {
+            assigned += sizeIt->second;
+        }
+    }
+
+    uint64_t totalAvailable = 0;
+    int driveCount = destTree_.GetDriveCount();
+    for (int i = 0; i < driveCount; i++) {
+        totalAvailable += destTree_.GetDrive(i).freeBytes;
     }
 
     std::wstring status = L"Selected: " + Utils::FormatSize(selected) +
-                          L" / " + Utils::FormatSize(available) + L" available";
+                          L" | Assigned: " + Utils::FormatSize(assigned) +
+                          L" | Available: " + Utils::FormatSize(totalAvailable) +
+                          L" across " + std::to_wstring(driveCount) + L" drive";
+    if (driveCount != 1) status += L"s";
     SetWindowTextW(hStatusLabel_, status.c_str());
 
-    // Update capacity bar
+    // Update capacity bar based on assigned vs total available
     int pct = 0;
-    if (available > 0) {
-        pct = static_cast<int>((selected * 1000) / available);
+    if (totalAvailable > 0) {
+        pct = static_cast<int>((assigned * 1000) / totalAvailable);
         if (pct > 1000) pct = 1000;
     }
     SendMessageW(hCapacityBar_, PBM_SETPOS, pct, 0);
 
-    // Color the bar red if over capacity
-    if (selected > available && available > 0) {
+    if (assigned > totalAvailable && totalAvailable > 0) {
         SendMessageW(hCapacityBar_, PBM_SETBARCOLOR, 0, RGB(220, 50, 50));
     } else {
         SendMessageW(hCapacityBar_, PBM_SETBARCOLOR, 0, RGB(60, 160, 60));
@@ -810,7 +840,6 @@ void MainWindow::SetOperationInProgress(bool inProgress) {
     ShowWindow(hSpeedLabel_, inProgress ? SW_SHOW : SW_HIDE);
     ShowWindow(hCancelBtn_, inProgress ? SW_SHOW : SW_HIDE);
 
-    EnableWindow(hDriveCombo_, !inProgress);
     EnableWindow(hBrowseBtn_, !inProgress);
     EnableWindow(hSelectAllBtn_, !inProgress);
     EnableWindow(hDeselectAllBtn_, !inProgress);
@@ -818,6 +847,8 @@ void MainWindow::SetOperationInProgress(bool inProgress) {
     EnableWindow(hCopyBtn_, !inProgress);
     EnableWindow(hMoveBtn_, !inProgress);
     EnableWindow(hVerifyCheck_, !inProgress);
+    EnableWindow(hAddDriveBtn_, !inProgress);
+    EnableWindow(hRemoveDriveBtn_, !inProgress);
 
     if (inProgress) {
         SendMessageW(hProgressBar_, PBM_SETPOS, 0, 0);
@@ -830,17 +861,14 @@ void MainWindow::SetOperationInProgress(bool inProgress) {
 void MainWindow::OnMigrationProgress(int progress) {
     SendMessageW(hProgressBar_, PBM_SETPOS, progress, 0);
 
-    // Calculate transfer speed from elapsed time and progress
     ULONGLONG elapsed = GetTickCount64() - migrationStartTick_;
     if (elapsed > 500 && progress > 0 && migrationTotalBytes_ > 0) {
         double bytesTransferred = (static_cast<double>(progress) / 1000.0) * migrationTotalBytes_;
         double seconds = elapsed / 1000.0;
         double bytesPerSec = bytesTransferred / seconds;
 
-        // Format speed + percentage
         std::wstring speed = Utils::FormatSizeShort(static_cast<uint64_t>(bytesPerSec)) + L"/s";
 
-        // ETA
         double remaining = migrationTotalBytes_ - bytesTransferred;
         int etaSec = (bytesPerSec > 0) ? static_cast<int>(remaining / bytesPerSec) : 0;
         if (etaSec > 0) {
@@ -865,25 +893,20 @@ void MainWindow::OnMigrationFile(const wchar_t* filename) {
 void MainWindow::OnMigrationComplete(int status) {
     SetOperationInProgress(false);
 
-    // End transfer logging and reload log
-    transferLog_.EndLogging();
-    if (selectedDriveIndex_ >= 0) {
-        std::wstring serialHex = TransferLog::FormatSerial(drives_[selectedDriveIndex_].serialNumber);
-        logLoaded_ = transferLog_.Load(exeDir_, serialHex);
-        if (logLoaded_) {
-            fileTree_.SetExcludedPaths(&transferLog_.GetLoggedPaths());
-        }
+    // Reload JSON transfer log
+    transferLog_.Clear();
+    transferLog_.Load(jsonLogPath_);
+    fileTree_.SetTransferredPaths(&transferLog_.GetPathMap());
+
+    // Refresh drive info for all dest drives
+    for (int i = 0; i < destTree_.GetDriveCount(); i++) {
+        DriveInfo::RefreshDriveSpace(destTree_.GetDrive(i));
     }
 
-    // Refresh drive info
-    if (selectedDriveIndex_ >= 0) {
-        DriveInfo::RefreshDriveSpace(drives_[selectedDriveIndex_]);
-        SendMessageW(hDriveCombo_, CB_DELETESTRING, selectedDriveIndex_, 0);
-        SendMessageW(hDriveCombo_, CB_INSERTSTRING, selectedDriveIndex_,
-            reinterpret_cast<LPARAM>(drives_[selectedDriveIndex_].displayString.c_str()));
-        SendMessageW(hDriveCombo_, CB_SETCURSEL, selectedDriveIndex_, 0);
-    }
-    UpdateStatusBar();
+    // Clear assignments and rebuild
+    assignments_.clear();
+    fileSizes_.clear();
+    OnAssignmentsChanged();
 
     if (status == 0) {
         MessageBoxW(hWnd_, L"Migration completed successfully.",
@@ -898,6 +921,5 @@ void MainWindow::OnMigrationComplete(int status) {
 }
 
 void MainWindow::OnMigrationError(const wchar_t* errorMsg) {
-    // Show in progress label rather than blocking with a dialog during operation
     SetWindowTextW(hProgressLabel_, errorMsg);
 }

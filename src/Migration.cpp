@@ -1,4 +1,5 @@
 #include "Migration.h"
+#include "TransferLog.h"
 #include "Utils.h"
 #include <string>
 
@@ -85,7 +86,6 @@ static void PostProgress(CopyCallbackData* cb, uint64_t bytesInFile) {
 }
 
 // High-performance copy using unbuffered overlapped I/O with double buffering.
-// Reads into buffer A while writing from buffer B, keeping both drives busy.
 static bool FastCopyFile(const std::wstring& src, const std::wstring& dst,
                          uint64_t fileSize, CopyCallbackData* cbData) {
     // Allocate two sector-aligned buffers
@@ -299,58 +299,26 @@ DWORD WINAPI Migration::ThreadProc(LPVOID param) {
 void Migration::Run() {
     uint64_t bytesDone = 0;
     bool hadError = false;
-    std::wstring errorMsg;
 
-    // Helper to open a log file for appending (creates with header if new)
-    auto openAppendLog = [&](const std::wstring& path) -> HANDLE {
-        if (path.empty()) return INVALID_HANDLE_VALUE;
+    // Load existing transfer log so we can append
+    TransferLog log;
+    log.Load(params_.jsonLogPath);
+    log.SetSourcePath(params_.sourcePath);
 
-        size_t sep = path.find_last_of(L"\\/");
-        if (sep != std::wstring::npos) {
-            Utils::EnsureDirectoryExists(path.substr(0, sep));
-        }
+    int saveCounter = 0;
 
-        bool isNew = (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES);
-
-        HANDLE h = CreateFileW(path.c_str(),
-            FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-
-        if (h == INVALID_HANDLE_VALUE) {
-            DWORD err = GetLastError();
-            wchar_t buf[1024];
-            swprintf_s(buf, L"Log create failed (%lu): %s", err, path.c_str());
-            wchar_t* msg = _wcsdup(buf);
-            PostMessageW(params_.hWndNotify, WM_MIGRATION_ERROR, 0, reinterpret_cast<LPARAM>(msg));
-            return INVALID_HANDLE_VALUE;
-        }
-
-        if (isNew) {
-            const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-            DWORD written;
-            WriteFile(h, bom, 3, &written, nullptr);
-            Utils::WriteLogLine(h, L"# DSplit Transfer Log");
-            Utils::WriteLogLine(h, L"# Volume: " + params_.logVolumeName +
-                               L" (" + params_.logDriveLetter + L")");
-            Utils::WriteLogLine(h, L"# Serial: " + params_.logSerialHex);
-        }
-        return h;
-    };
-
-    // Open/create transfer logs (local + destination drive root)
-    HANDLE hLog = openAppendLog(params_.logFilePath);
-    HANDLE hDestLog = openAppendLog(params_.destLogFilePath);
-
-    // First pass: create all necessary directories
+    // First pass: create all necessary directories on each destination drive
     for (auto& item : params_.items) {
         if (cancelled_) break;
         if (!item.isDirectory) continue;
+        if (item.destDriveIndex < 0 || item.destDriveIndex >= static_cast<int>(params_.drives.size()))
+            continue;
 
-        std::wstring destPath = Utils::CombinePaths(params_.destRoot, item.relativePath);
+        const auto& drive = params_.drives[item.destDriveIndex];
+        std::wstring destPath = Utils::CombinePaths(
+            Utils::CombinePaths(drive.rootPath, params_.sourceFolderName),
+            item.relativePath);
         Utils::EnsureDirectoryExists(destPath);
-
-        Utils::WriteLogLine(hLog, item.relativePath + L"\\");
-        Utils::WriteLogLine(hDestLog, item.relativePath + L"\\");
     }
 
     // Second pass: copy/move files
@@ -360,8 +328,13 @@ void Migration::Run() {
     for (auto& item : params_.items) {
         if (cancelled_) break;
         if (item.isDirectory) continue;
+        if (item.destDriveIndex < 0 || item.destDriveIndex >= static_cast<int>(params_.drives.size()))
+            continue;
 
-        std::wstring destPath = Utils::CombinePaths(params_.destRoot, item.relativePath);
+        const auto& drive = params_.drives[item.destDriveIndex];
+        std::wstring destPath = Utils::CombinePaths(
+            Utils::CombinePaths(drive.rootPath, params_.sourceFolderName),
+            item.relativePath);
 
         // Ensure parent directory exists (cached to avoid redundant checks)
         size_t lastSep = destPath.find_last_of(L"\\/");
@@ -373,7 +346,7 @@ void Migration::Run() {
             }
         }
 
-        // Throttle file name updates to avoid flooding the message queue
+        // Throttle file name updates
         ULONGLONG now = GetTickCount64();
         if (now - lastFilePostTime >= 80) {
             wchar_t* fileMsg = _wcsdup(item.relativePath.c_str());
@@ -415,20 +388,18 @@ void Migration::Run() {
                     bytesDone = cbData.bytesCopiedBefore;
 
                     if (params_.verifyBeforeDelete && !cancelled_) {
-                        // Show verify status
                         std::wstring verifyMsg = L"Verifying: " + item.relativePath;
                         wchar_t* vMsg = _wcsdup(verifyMsg.c_str());
                         PostMessageW(params_.hWndNotify, WM_MIGRATION_FILE, 0, reinterpret_cast<LPARAM>(vMsg));
 
                         if (!VerifyFilesMatch(item.sourcePath, destPath, item.fileSize, cancelled_)) {
-                            // Verification failed — don't delete source
                             wchar_t errBuf[512];
                             swprintf_s(errBuf, L"Verify FAILED (source kept): %s",
                                 item.relativePath.c_str());
                             wchar_t* errMsg = _wcsdup(errBuf);
                             PostMessageW(params_.hWndNotify, WM_MIGRATION_ERROR, 0, reinterpret_cast<LPARAM>(errMsg));
                             hadError = true;
-                            continue; // skip delete, move to next file
+                            continue;
                         }
                     }
 
@@ -448,10 +419,15 @@ void Migration::Run() {
             }
         }
 
-        // Log successful transfer to both log files
+        // Log successful transfer to JSON
         if (success) {
-            Utils::WriteLogLine(hLog, item.relativePath);
-            Utils::WriteLogLine(hDestLog, item.relativePath);
+            log.AddEntry(item.relativePath, drive.serialHex, item.fileSize);
+            saveCounter++;
+            // Save every 10 files for crash resilience
+            if (saveCounter >= 10) {
+                log.Save(params_.jsonLogPath);
+                saveCounter = 0;
+            }
         }
 
         if (!success && !cancelled_) {
@@ -459,10 +435,9 @@ void Migration::Run() {
             wchar_t errBuf[512];
             swprintf_s(errBuf, L"Error processing: %s\nError code: %lu",
                 item.relativePath.c_str(), err);
-            errorMsg = errBuf;
             hadError = true;
 
-            wchar_t* errMsg = _wcsdup(errorMsg.c_str());
+            wchar_t* errMsg = _wcsdup(errBuf);
             PostMessageW(params_.hWndNotify, WM_MIGRATION_ERROR, 0, reinterpret_cast<LPARAM>(errMsg));
         }
     }
@@ -476,15 +451,8 @@ void Migration::Run() {
         }
     }
 
-    // Close transfer logs
-    if (hLog != INVALID_HANDLE_VALUE) {
-        CloseHandle(hLog);
-        hLog = INVALID_HANDLE_VALUE;
-    }
-    if (hDestLog != INVALID_HANDLE_VALUE) {
-        CloseHandle(hDestLog);
-        hDestLog = INVALID_HANDLE_VALUE;
-    }
+    // Final save of the JSON log
+    log.Save(params_.jsonLogPath);
 
     // Signal completion
     PostMessageW(params_.hWndNotify, WM_MIGRATION_COMPLETE,

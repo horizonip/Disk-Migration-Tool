@@ -3,15 +3,15 @@
 #include <commctrl.h>
 #include <string>
 #include <vector>
-#include <unordered_set>
-#include <atomic>
+#include <unordered_map>
+#include <cstdint>
 #include "DriveInfo.h"
 #include "FileTree.h"
+#include "DestinationTree.h"
 #include "Migration.h"
 #include "TransferLog.h"
 
 // Control IDs
-#define IDC_DRIVE_COMBO     1001
 #define IDC_SOURCE_EDIT     1002
 #define IDC_BROWSE_BTN      1003
 #define IDC_FILE_TREE       1004
@@ -27,10 +27,12 @@
 #define IDC_CANCEL_BTN      1014
 #define IDC_SPEED_LABEL     1015
 #define IDC_VERIFY_CHECK    1016
+#define IDC_DEST_TREE       1017
+#define IDC_ADD_DRIVE_BTN   1018
+#define IDC_REMOVE_DRIVE_BTN 1019
 
 // Custom messages
 #define WM_TREE_CHECK_CHANGED (WM_USER + 200)
-#define WM_INDEXING_COMPLETE  (WM_USER + 201)
 
 class MainWindow {
 public:
@@ -45,7 +47,6 @@ private:
     void OnSize(int width, int height);
     void OnCommand(WORD id, WORD code);
     void OnNotify(NMHDR* pnm);
-    void OnDriveSelChanged();
     void OnBrowseFolder();
     void OnSelectAll();
     void OnDeselectAll();
@@ -53,9 +54,15 @@ private:
     void OnCopy();
     void OnMove();
     void OnCancel();
+    void OnAddDrive();
+    void OnRemoveDrive();
     void UpdateStatusBar();
     void SetOperationInProgress(bool inProgress);
     void StartMigration(bool moveMode);
+
+    // Assignment model
+    void UpdateAssignments();
+    void OnAssignmentsChanged();
 
     // Message handlers for migration progress
     void OnMigrationProgress(int progress);
@@ -63,23 +70,23 @@ private:
     void OnMigrationComplete(int status);
     void OnMigrationError(const wchar_t* errorMsg);
 
-    // Drive indexing
-    void StartDriveIndexing();
-    void CancelDriveIndexing();
-    void OnIndexingComplete();
-    void BuildFilteredExclusions();
-
     HWND hWnd_ = nullptr;
     HINSTANCE hInstance_ = nullptr;
     HFONT hFont_ = nullptr;
 
-    // Controls
-    HWND hDriveLabel_ = nullptr;
-    HWND hDriveCombo_ = nullptr;
+    // Controls — left side (source)
     HWND hSourceLabel_ = nullptr;
     HWND hSourceEdit_ = nullptr;
     HWND hBrowseBtn_ = nullptr;
     HWND hTreeView_ = nullptr;
+
+    // Controls — right side (destination)
+    HWND hDestLabel_ = nullptr;
+    HWND hDestTreeView_ = nullptr;
+    HWND hAddDriveBtn_ = nullptr;
+    HWND hRemoveDriveBtn_ = nullptr;
+
+    // Controls — bottom (shared)
     HWND hStatusLabel_ = nullptr;
     HWND hCapacityBar_ = nullptr;
     HWND hSelectAllBtn_ = nullptr;
@@ -94,21 +101,19 @@ private:
     HWND hCancelBtn_ = nullptr;
 
     // Data
-    std::vector<DriveEntry> drives_;
     FileTree fileTree_;
+    DestinationTree destTree_;
     Migration migration_;
     TransferLog transferLog_;
-    bool logLoaded_ = false;
     std::wstring exeDir_;
-    int selectedDriveIndex_ = -1;
+    std::wstring jsonLogPath_;
     ULONGLONG migrationStartTick_ = 0;
     uint64_t migrationTotalBytes_ = 0;
 
-    // Drive indexing (background thread)
-    HANDLE hIndexThread_ = nullptr;
-    std::unordered_set<std::wstring> driveIndex_;
-    std::unordered_set<std::wstring> filteredExclusions_;
-    std::atomic<bool> indexCancelled_{false};
+    // Assignment map: relativePath -> driveIndex in destTree_
+    std::unordered_map<std::wstring, int> assignments_;
+    // File sizes for quick lookup: relativePath -> size
+    std::unordered_map<std::wstring, uint64_t> fileSizes_;
 
     static const wchar_t* CLASS_NAME;
 };

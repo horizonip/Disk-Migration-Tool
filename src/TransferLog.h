@@ -1,44 +1,60 @@
 #pragma once
 #include <windows.h>
 #include <string>
-#include <unordered_set>
-#include <cstdio>
+#include <vector>
+#include <unordered_map>
+#include <cstdint>
+
+struct TransferEntry {
+    std::wstring relativePath;
+    std::wstring serialHex;  // destination drive serial
+    uint64_t size;
+};
 
 class TransferLog {
 public:
     TransferLog();
     ~TransferLog();
 
-    // Load existing log into memory. Returns true if file existed.
-    bool Load(const std::wstring& exeDir, const std::wstring& serialHex);
+    // Load JSON log from file. Returns true if file existed and parsed.
+    bool Load(const std::wstring& logPath);
 
-    // Check if a relative path is in the logged set
+    // Save all entries to JSON file via CreateFileW/WriteFile.
+    bool Save(const std::wstring& logPath) const;
+
+    // Check if a relative path has been transferred
     bool Contains(const std::wstring& relativePath) const;
 
-    // Open log file for appending. Writes header if new file.
-    bool BeginLogging(const std::wstring& exeDir, const std::wstring& serialHex,
-                      const std::wstring& volumeName, const std::wstring& driveLetter);
+    // Get the destination serial for a transferred path (empty if not found)
+    std::wstring GetSerial(const std::wstring& relativePath) const;
 
-    // Append a single entry to the open log file
-    void AppendEntry(const std::wstring& relativePath, bool isDirectory);
+    // Add a new transfer entry
+    void AddEntry(const std::wstring& relativePath, const std::wstring& serialHex, uint64_t size);
 
-    // Close the log file
-    void EndLogging();
+    // Get all entries
+    const std::vector<TransferEntry>& GetEntries() const { return entries_; }
 
-    // Add a path to the in-memory exclusion set (for indexing)
-    void AddExclusion(const std::wstring& relativePath);
+    // Get the path->serial map
+    const std::unordered_map<std::wstring, std::wstring>& GetPathMap() const { return pathMap_; }
 
-    // Get const ref to the logged paths set
-    const std::unordered_set<std::wstring>& GetLoggedPaths() const;
+    // Get/set source path stored in the log
+    const std::wstring& GetSourcePath() const { return sourcePath_; }
+    void SetSourcePath(const std::wstring& path) { sourcePath_ = path; }
 
     // Reset all state
     void Clear();
 
+    // Hash a source folder path to 16 hex chars (FNV-1a) for log filename
+    static std::wstring HashSourcePath(const std::wstring& path);
+
     // Format a DWORD serial as 8-char uppercase hex
     static std::wstring FormatSerial(DWORD serial);
 
+    // Build the log file path for a given source folder under exeDir
+    static std::wstring GetLogPath(const std::wstring& exeDir, const std::wstring& sourcePath);
+
 private:
-    std::unordered_set<std::wstring> paths_;
-    FILE* logFile_ = nullptr;
-    std::wstring logFilePath_;
+    std::wstring sourcePath_;
+    std::vector<TransferEntry> entries_;
+    std::unordered_map<std::wstring, std::wstring> pathMap_; // relativePath -> serialHex
 };

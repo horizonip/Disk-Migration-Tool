@@ -206,13 +206,13 @@ void FileTree::DeselectAll() {
     suppressCheckHandling_ = false;
 }
 
-void FileTree::CollectLeaves(HTREEITEM hItem, std::vector<LeafItem>& leaves) {
+void FileTree::CollectLeaves(HTREEITEM hItem, std::vector<LeafItem>& leaves) const {
     HTREEITEM hChild = TreeView_GetChild(hTree_, hItem);
     if (!hChild) {
         // This is a leaf
         auto it = itemMap_.find(hItem);
         if (it != itemMap_.end() && !it->second.isDirectory) {
-            leaves.push_back({ hItem, it->second.size });
+            leaves.push_back({ hItem, it->second.size, it->second.relativePath });
         }
         return;
     }
@@ -222,8 +222,14 @@ void FileTree::CollectLeaves(HTREEITEM hItem, std::vector<LeafItem>& leaves) {
     }
 }
 
-void FileTree::SetExcludedPaths(const std::unordered_set<std::wstring>* excluded) {
-    excludedPaths_ = excluded;
+void FileTree::SetTransferredPaths(const std::unordered_map<std::wstring, std::wstring>* transferred) {
+    transferredPaths_ = transferred;
+    if (hTree_) InvalidateRect(hTree_, nullptr, TRUE);
+}
+
+bool FileTree::IsTransferred(const std::wstring& relativePath) const {
+    if (!transferredPaths_) return false;
+    return transferredPaths_->count(relativePath) > 0;
 }
 
 void FileTree::AutoSelect(uint64_t availableBytes) {
@@ -250,12 +256,9 @@ void FileTree::AutoSelect(uint64_t availableBytes) {
     // Greedy select until we exceed available space
     uint64_t cumulative = 0;
     for (auto& leaf : leaves) {
-        // Skip files already on destination
-        if (excludedPaths_) {
-            auto it = itemMap_.find(leaf.hItem);
-            if (it != itemMap_.end() && excludedPaths_->count(it->second.relativePath)) {
-                continue;
-            }
+        // Skip files already transferred
+        if (transferredPaths_ && transferredPaths_->count(leaf.relativePath)) {
+            continue;
         }
         if (cumulative + leaf.size > availableBytes) {
             continue; // skip files that don't fit, try smaller ones
@@ -312,4 +315,39 @@ std::vector<FileTree::SelectedFile> FileTree::GetSelectedFiles() const {
         hItem = TreeView_GetNextSibling(hTree_, hItem);
     }
     return files;
+}
+
+std::vector<FileTree::LeafFile> FileTree::GetAllLeafFiles() const {
+    std::vector<LeafItem> leaves;
+    HTREEITEM hItem = TreeView_GetRoot(hTree_);
+    while (hItem) {
+        CollectLeaves(hItem, leaves);
+        hItem = TreeView_GetNextSibling(hTree_, hItem);
+    }
+
+    std::vector<LeafFile> result;
+    result.reserve(leaves.size());
+    for (auto& l : leaves) {
+        result.push_back({ l.hItem, l.relativePath, l.size });
+    }
+    return result;
+}
+
+void FileTree::SetItemChecked(HTREEITEM hItem, bool checked) {
+    SetCheckState(hItem, checked);
+}
+
+void FileTree::PropagateCheckStates() {
+    // For each leaf that is checked, ensure parents are checked
+    // Simple approach: walk all items, check parents bottom-up
+    for (auto& [hItem, data] : itemMap_) {
+        if (GetCheckState(hItem)) {
+            HTREEITEM hParent = TreeView_GetParent(hTree_, hItem);
+            while (hParent) {
+                if (GetCheckState(hParent)) break; // already checked up
+                SetCheckState(hParent, true);
+                hParent = TreeView_GetParent(hTree_, hParent);
+            }
+        }
+    }
 }

@@ -88,4 +88,58 @@ void WriteLogLine(HANDLE hFile, const std::wstring& line) {
     WriteFile(hFile, utf8.c_str(), (DWORD)utf8.size(), &written, nullptr);
 }
 
+std::wstring JsonEscape(const std::wstring& s) {
+    std::wstring result;
+    result.reserve(s.size() + 8);
+    for (wchar_t ch : s) {
+        switch (ch) {
+        case L'"':  result += L"\\\""; break;
+        case L'\\': result += L"\\\\"; break;
+        case L'\n': result += L"\\n"; break;
+        case L'\r': result += L"\\r"; break;
+        case L'\t': result += L"\\t"; break;
+        default:
+            if (ch < 0x20) {
+                wchar_t buf[8];
+                swprintf_s(buf, L"\\u%04X", (unsigned)ch);
+                result += buf;
+            } else {
+                result += ch;
+            }
+            break;
+        }
+    }
+    return result;
+}
+
+std::wstring JsonUnescape(const std::wstring& s) {
+    std::wstring result;
+    result.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == L'\\' && i + 1 < s.size()) {
+            i++;
+            switch (s[i]) {
+            case L'"':  result += L'"'; break;
+            case L'\\': result += L'\\'; break;
+            case L'/':  result += L'/'; break;
+            case L'n':  result += L'\n'; break;
+            case L'r':  result += L'\r'; break;
+            case L't':  result += L'\t'; break;
+            case L'u':
+                if (i + 4 < s.size()) {
+                    wchar_t hex[5] = { s[i+1], s[i+2], s[i+3], s[i+4], 0 };
+                    unsigned long val = wcstoul(hex, nullptr, 16);
+                    result += static_cast<wchar_t>(val);
+                    i += 4;
+                }
+                break;
+            default: result += s[i]; break;
+            }
+        } else {
+            result += s[i];
+        }
+    }
+    return result;
+}
+
 } // namespace Utils

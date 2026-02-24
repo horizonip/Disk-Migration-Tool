@@ -20,4 +20,10 @@ bool EnsureDirectoryExists(const std::wstring& path);
 // Write a wide string as UTF-8 + CRLF to a file handle
 void WriteLogLine(HANDLE hFile, const std::wstring& line);
 
+// Escape a wide string for JSON (backslash, quote, control chars)
+std::wstring JsonEscape(const std::wstring& s);
+
+// Unescape a JSON string (reverse of JsonEscape)
+std::wstring JsonUnescape(const std::wstring& s);
+
 } // namespace Utils
